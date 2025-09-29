@@ -32,16 +32,65 @@ class TranslationEditorHome extends StatefulWidget {
 }
 
 class _TranslationEditorHomeState extends State<TranslationEditorHome> {
-  Map<String, dynamic> _translations = {};
+  // Maximum file size limit (10MB per file)
+  static const int _maxFileSizeBytes = 10 * 1024 * 1024;
+
+  // Maximum total memory usage limit (100MB)
+  static const int _maxTotalMemoryBytes = 100 * 1024 * 1024;
+
   List<String> _availableLocales = [];
-  String? _selectedLocale;
-  String _searchQuery = '';
   bool _hasUnsavedChanges = false;
+  final ScrollController _scrollController = ScrollController();
   final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
+  String? _selectedLocale;
+  Map<String, dynamic> _translations = {};
+  // Controllers for translation values - managed per key
+  final Map<String, TextEditingController> _valueControllers = {};
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    _scrollController.dispose();
+    // Dispose all value controllers
+    for (var controller in _valueControllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
 
   @override
   void initState() {
     super.initState();
+  }
+
+  TextEditingController _getOrCreateController(String key, String value) {
+    if (!_valueControllers.containsKey(key)) {
+      _valueControllers[key] = TextEditingController(text: value);
+    } else {
+      // Update existing controller if value has changed
+      final controller = _valueControllers[key]!;
+      if (controller.text != value) {
+        controller.text = value;
+      }
+    }
+    return _valueControllers[key]!;
+  }
+
+  void _cleanupControllers() {
+    // Dispose all controllers when switching locales
+    for (var controller in _valueControllers.values) {
+      controller.dispose();
+    }
+    _valueControllers.clear();
+  }
+
+  void _clearAllControllers() {
+    // Dispose all controllers
+    for (var controller in _valueControllers.values) {
+      controller.dispose();
+    }
+    _valueControllers.clear();
   }
 
   Future<void> _loadTranslationFiles() async {
@@ -53,8 +102,42 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
       );
 
       if (result != null && result.files.isNotEmpty) {
+        // Check total file sizes before loading
+        int totalSize = 0;
+        List<String> oversizedFiles = [];
+
+        for (PlatformFile file in result.files) {
+          if (file.size > _maxFileSizeBytes) {
+            oversizedFiles.add('${file.name} (${_formatFileSize(file.size)})');
+          } else {
+            totalSize += file.size;
+          }
+        }
+
+        if (oversizedFiles.isNotEmpty) {
+          _showErrorDialog(
+            'The following files are too large (>${_formatFileSize(_maxFileSizeBytes)}):\n'
+            '${oversizedFiles.join('\n')}\n\n'
+            'Please select smaller files or split them into multiple files.',
+          );
+          return;
+        }
+
+        if (totalSize > _maxTotalMemoryBytes) {
+          _showErrorDialog(
+            'Total file size (${_formatFileSize(totalSize)}) exceeds the limit of '
+            '${_formatFileSize(_maxTotalMemoryBytes)}. Please select fewer files.',
+          );
+          return;
+        }
+
         Map<String, dynamic> newTranslations = {};
         List<String> newLocales = [];
+
+        // Show loading dialog once for large file sets
+        if (result.files.length > 10) {
+          _showLoadingDialog('Loading files...');
+        }
 
         for (PlatformFile file in result.files) {
           try {
@@ -79,7 +162,19 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
           }
         }
 
+        // Hide loading dialog if shown
+        if (result.files.length > 10) {
+          try {
+            Navigator.of(context).pop();
+          } catch (e) {
+            // Dialog might already be dismissed, ignore error
+          }
+        }
+
         if (newTranslations.isNotEmpty) {
+          // Clear existing controllers to prevent memory leaks
+          _clearAllControllers();
+
           // Synchronize keys across all translation files
           _synchronizeTranslationKeys(newTranslations);
 
@@ -89,11 +184,22 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
             _selectedLocale = newLocales.first;
             _hasUnsavedChanges = false;
           });
+
+          // Show success message
+          _showSuccessDialog(
+            'Successfully loaded ${newLocales.length} translation files with synchronized keys',
+          );
         } else {
           _showErrorDialog('No valid JSON files were loaded');
         }
       }
     } catch (e) {
+      // Ensure loading dialog is dismissed even on error
+      try {
+        Navigator.of(context).pop();
+      } catch (_) {
+        // Dialog might not be shown, ignore error
+      }
       _showErrorDialog('Error loading files: $e');
     }
   }
@@ -119,9 +225,19 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
 
   void _updateTranslation(String key, String value) {
     if (_selectedLocale != null && _translations.containsKey(_selectedLocale)) {
+      // Update the translation data immediately
+      _translations[_selectedLocale!][key] = value;
+      _hasUnsavedChanges = true;
+
+      // Don't trigger any UI updates while typing
+      // The UI will only update when the user switches locales or performs other actions
+    }
+  }
+
+  void _refreshUI() {
+    if (mounted) {
       setState(() {
-        _translations[_selectedLocale!][key] = value;
-        _hasUnsavedChanges = true;
+        // Trigger a rebuild to update the UI
       });
     }
   }
@@ -214,7 +330,8 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
     try {
       String? outputDir = await FilePicker.platform.getDirectoryPath();
       if (outputDir != null) {
-        final localeData = _translations[_selectedLocale!];
+        final localeData =
+            _translations[_selectedLocale!] as Map<String, dynamic>;
 
         final sortedData = Map.fromEntries(
           localeData.entries.toList()..sort((a, b) => a.key.compareTo(b.key)),
@@ -244,7 +361,7 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
       if (outputDir != null) {
         for (String locale in _availableLocales) {
           if (_translations.containsKey(locale)) {
-            final localeData = _translations[locale];
+            final localeData = _translations[locale] as Map<String, dynamic>;
 
             final sortedData = Map.fromEntries(
               localeData.entries.toList()
@@ -297,6 +414,30 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
             child: const Text('OK'),
           ),
         ],
+      ),
+    );
+  }
+
+  String _formatFileSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024)
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+  }
+
+  void _showLoadingDialog(String message) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        content: Row(
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(width: 16),
+            Text(message),
+          ],
+        ),
       ),
     );
   }
@@ -391,24 +532,6 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
     return keys;
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Translation Locale Editor'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        actions: [
-          if (_hasUnsavedChanges)
-            const Icon(Icons.circle, color: Colors.orange, size: 12),
-          const SizedBox(width: 8),
-        ],
-      ),
-      body: _translations.isEmpty
-          ? _buildEmptyState()
-          : _buildEditorInterface(),
-    );
-  }
-
   Widget _buildEmptyState() {
     return Center(
       child: Column(
@@ -487,6 +610,8 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
             label: const Text('Add Key'),
           ),
           const Spacer(),
+          _buildMemoryUsageIndicator(),
+          const SizedBox(width: 16),
           if (_hasUnsavedChanges)
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -510,6 +635,76 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
                 ],
               ),
             ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMemoryUsageIndicator() {
+    if (_translations.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    // Calculate approximate memory usage
+    int totalSize = 0;
+    int totalKeys = 0;
+    int totalControllers = _valueControllers.length;
+
+    for (String locale in _translations.keys) {
+      final localeData = _translations[locale] as Map<String, dynamic>;
+      totalKeys += localeData.length;
+
+      // Rough estimation of memory usage (JSON strings + objects)
+      for (String key in localeData.keys) {
+        final value = localeData[key] as String? ?? '';
+        totalSize += key.length * 2; // UTF-16 encoding
+        totalSize += value.length * 2; // UTF-16 encoding
+        totalSize += 64; // Object overhead estimation
+      }
+    }
+
+    final memoryUsage = _formatFileSize(totalSize);
+    final isHighUsage = totalSize > _maxTotalMemoryBytes * 0.8; // 80% of limit
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: isHighUsage ? Colors.red[50] : Colors.blue[50],
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: isHighUsage ? Colors.red[300]! : Colors.blue[300]!,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            isHighUsage ? Icons.memory : Icons.storage,
+            size: 14,
+            color: isHighUsage ? Colors.red[700] : Colors.blue[700],
+          ),
+          const SizedBox(width: 4),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                memoryUsage,
+                style: TextStyle(
+                  color: isHighUsage ? Colors.red[700] : Colors.blue[700],
+                  fontWeight: FontWeight.bold,
+                  fontSize: 11,
+                ),
+              ),
+              Text(
+                '$totalKeys keys, $totalControllers controllers',
+                style: TextStyle(
+                  color: isHighUsage ? Colors.red[600] : Colors.blue[600],
+                  fontSize: 9,
+                ),
+              ),
+            ],
+          ),
         ],
       ),
     );
@@ -562,6 +757,8 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
                         _searchQuery = '';
                         _searchController.clear();
                       });
+                      _cleanupControllers();
+                      _refreshUI();
                     },
                     trailing: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -608,6 +805,7 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
         _buildTranslationHeader(filteredKeys),
         Expanded(
           child: ListView.builder(
+            controller: _scrollController,
             itemCount: filteredKeys.length,
             itemBuilder: (context, index) {
               final key = filteredKeys[index];
@@ -738,8 +936,10 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
   }
 
   Widget _buildTranslationItem(String key, String value) {
-    final TextEditingController valueController = TextEditingController(
-      text: value,
+    // Create controller when building the item
+    final TextEditingController valueController = _getOrCreateController(
+      key,
+      value,
     );
     final bool isEmpty = value.isEmpty;
 
@@ -859,6 +1059,24 @@ class _TranslationEditorHomeState extends State<TranslationEditorHome> {
           ],
         ),
       ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Translation Locale Editor'),
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          if (_hasUnsavedChanges)
+            const Icon(Icons.circle, color: Colors.orange, size: 12),
+          const SizedBox(width: 8),
+        ],
+      ),
+      body: _translations.isEmpty
+          ? _buildEmptyState()
+          : _buildEditorInterface(),
     );
   }
 }
